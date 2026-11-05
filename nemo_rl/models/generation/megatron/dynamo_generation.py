@@ -50,6 +50,7 @@ from nemo_rl.models.generation.interfaces import (
 )
 from nemo_rl.models.generation.megatron.config import MCoreGenerationConfig
 from nemo_rl.models.generation.megatron.dynamo_config import (
+    DYNAMO_COMPONENT_BY_ROLE,
     MegatronDynamoCfg,
     MegatronDynamoRole,
     disaggregation_cfg,
@@ -73,10 +74,6 @@ if TYPE_CHECKING:
     from nemo_rl.models.policy.lm_policy import Policy
 
 LOGGER = logging.getLogger(__name__)
-
-# Dynamo component each role registers under: the frontend's prefill router
-# sends the prefill leg to "prefill" and the decode leg to "backend".
-_COMPONENT_BY_ROLE: dict[str, str] = {"prefill": "prefill", "decode": "backend"}
 
 
 def role_policy_config(
@@ -380,9 +377,9 @@ class MegatronDynamoGeneration(GenerationInterface):
         self._port_range_low = cluster.port_range_low
         self._port_range_high = cluster.port_range_high
         self._node_resource_constraints = cluster.node_resource_constraints
-        # Every control call is bounded: pause and resume by their timeout_s
-        # (control_timeout_s when None), one deadline per call, and
-        # prepare_refit_info by control_timeout_s.
+        # Bounds the refit calls (pause and resume by their timeout_s, which
+        # defaults to this, one deadline per call) and every endpoint and
+        # shutdown call to an engine's workers.
         self._control_timeout_s = float(self._dynamo_cfg.control_timeout_s)
         # One record per engine, in launch (refit rank) order; what refit calls use.
         self._engine_records: list[MegatronDynamoEngine] = []
@@ -490,7 +487,7 @@ class MegatronDynamoGeneration(GenerationInterface):
         """Dynamo component name to the number of engines registering under it."""
         counts: dict[str, int] = {}
         for record in self._engine_records:
-            component = _COMPONENT_BY_ROLE[record.role]
+            component = DYNAMO_COMPONENT_BY_ROLE[record.role]
             counts[component] = counts.get(component, 0) + 1
         return counts
 
@@ -505,18 +502,25 @@ class MegatronDynamoGeneration(GenerationInterface):
 
         Used while waiting for the engines to register with the frontend, so a
         dead engine fails the wait at once instead of at the startup timeout.
+        A worker whose actor died raises ``RayActorError`` on the probe; that
+        counts as dead, and the first such error is chained.
         """
-        alive = ray.get(
-            [record.liveness_ref() for record in self._engine_records],
-            timeout=self._control_timeout_s,
-        )
-        dead = [
-            record.instance_id
-            for record, ok in zip(self._engine_records, alive)
-            if not ok
-        ]
+        deadline = time.monotonic() + self._control_timeout_s
+        pending = [(record, record.liveness_ref()) for record in self._engine_records]
+        dead: list[str] = []
+        first_error: Exception | None = None
+        for record, future in pending:
+            try:
+                alive = ray.get(future, timeout=_seconds_left(deadline))
+            except ray.exceptions.RayActorError as error:
+                first_error = first_error or error
+                alive = False
+            if not alive:
+                dead.append(record.instance_id)
         if dead:
-            raise RuntimeError(f"Megatron engines died: {', '.join(dead)}")
+            raise RuntimeError(
+                f"Megatron engines died: {', '.join(dead)}"
+            ) from first_error
 
     def get_inference_world_size(self) -> int | None:
         """Ranks across the engines: their widths summed."""
@@ -657,7 +661,6 @@ class MegatronDynamoGeneration(GenerationInterface):
                 f"(train={train_world_size} + engines={self.inference_world_size})"
             )
         membership = self.full_fleet_membership(train_world_size)
-        self.check_full_fleet(membership)
         futures: list[ray.ObjectRef] = []
         for index, record in enumerate(self._engine_records):
             futures.extend(
@@ -1149,16 +1152,22 @@ class MegatronDynamoGeneration(GenerationInterface):
             )
         return next(iter(node_ips))
 
-    def prefill_coordinator_addresses(self) -> list[str]:
-        """Coordinator addresses of the prefill engines that are listening."""
+    def _prefill_coordinator_addresses(self) -> list[str]:
+        """Coordinator addresses of the prefill engines that are listening.
+
+        Read from every prefill engine's rank zero at once, under one
+        control-timeout deadline. Engines that failed before their record
+        existed have no coordinator.
+        """
+        deadline = time.monotonic() + self._control_timeout_s
+        pending = [
+            record.leader.dynamo_coordinator_address.remote()
+            for record in self._engine_records
+            if record.role == "prefill"
+        ]
         addresses = []
-        # After a partial start there are engines without a record yet; none of
-        # them has a coordinator.
-        engines = self._engines[: len(self._engine_records)]
-        for record, engine in zip(self._engine_records, engines, strict=True):
-            if record.role != "prefill":
-                continue
-            address = engine.dynamo_coordinator_address()
+        for future in pending:
+            address = ray.get(future, timeout=_seconds_left(deadline))
             if address:
                 addresses.append(address)
         return addresses
@@ -1181,7 +1190,7 @@ class MegatronDynamoGeneration(GenerationInterface):
         prefill = [i for i, record in indexed if record.role == "prefill"]
         # Read before the decode engines stop: only their rank zero knows the
         # owner prefill pins KV blocks for.
-        owners = {index: self._handoff_owner(index) for index in decode}
+        owners = self._handoff_owners(decode)
         stopped_decode = []
         for index in decode:
             if self._stop_engine(index):
@@ -1192,9 +1201,11 @@ class MegatronDynamoGeneration(GenerationInterface):
                     "not attested as terminated",
                     self._engine_records[index].instance_id,
                 )
+        # Releases the KV blocks prefill still pins for the stopped decode
+        # engines; best effort at full teardown, since prefill stops next.
         if stopped_decode and prefill:
             self._confirm_decode_terminated(
-                attester=self._engines[prefill[0]],
+                attester=self._engine_records[prefill[0]],
                 owners=[owners[index] for index in stopped_decode],
             )
         for index in prefill:
@@ -1217,27 +1228,38 @@ class MegatronDynamoGeneration(GenerationInterface):
             runtime.shutdown()
         return True
 
-    def _handoff_owner(self, index: int) -> str | None:
-        """Decode engine ``index``'s handoff owner; None before its endpoint started."""
-        try:
-            metadata = ray.get(
+    def _handoff_owners(self, indices: Sequence[int]) -> dict[int, str | None]:
+        """Each decode engine's handoff owner; None before its endpoint started.
+
+        Read from every engine at once, under one control-timeout deadline.
+        """
+        deadline = time.monotonic() + self._control_timeout_s
+        pending = [
+            (
+                index,
                 self._engine_records[index].leader.dynamo_endpoint_metadata.remote(),
-                timeout=self._control_timeout_s,
             )
-        except Exception:
-            LOGGER.exception(
-                "Could not read the handoff owner of %s",
-                self._engine_records[index].instance_id,
-            )
-            return None
-        return None if metadata is None else metadata.get("handoff_owner")
+            for index in indices
+        ]
+        owners: dict[int, str | None] = {}
+        for index, future in pending:
+            try:
+                metadata = ray.get(future, timeout=_seconds_left(deadline))
+            except Exception:
+                LOGGER.exception(
+                    "Could not read the handoff owner of %s",
+                    self._engine_records[index].instance_id,
+                )
+                metadata = None
+            owners[index] = None if metadata is None else metadata.get("handoff_owner")
+        return owners
 
     def _confirm_decode_terminated(
-        self, *, attester: MegatronGeneration, owners: list[str | None]
+        self, *, attester: MegatronDynamoEngine, owners: list[str | None]
     ) -> None:
         """Have a prefill engine's rank zero attest the stopped decode owners."""
         try:
-            addresses = self.prefill_coordinator_addresses()
+            addresses = self._prefill_coordinator_addresses()
         except Exception:
             LOGGER.exception("Could not read prefill coordinator addresses")
             return
@@ -1253,8 +1275,14 @@ class MegatronDynamoGeneration(GenerationInterface):
             if not owner:
                 continue
             try:
-                accepted = attester.confirm_decode_terminated(
-                    addresses, owner, timeout_s
+                accepted = ray.get(
+                    attester.leader.confirm_decode_terminated.remote(
+                        coordinator_addresses=addresses,
+                        owner=owner,
+                        timeout_s=timeout_s,
+                    ),
+                    # The worker bounds its own wait at timeout_s plus a margin.
+                    timeout=timeout_s + 10.0,
                 )
             except Exception:
                 LOGGER.exception("Could not attest decode owner %s termination", owner)
@@ -1268,15 +1296,23 @@ class MegatronDynamoGeneration(GenerationInterface):
                 )
 
     def _stop_engine(self, index: int) -> bool:
-        """Stop one engine's Dynamo endpoint and policy; whether both stopped cleanly."""
+        """Stop one engine's Dynamo endpoint and policy; whether both stopped cleanly.
+
+        A hung or failed endpoint stop is logged and the engine is shut down
+        anyway, which kills its workers.
+        """
         stopped = True
-        if index < len(self._engines):
-            engine = self._engines[index]
+        if index < len(self._engine_records):
             try:
-                engine.stop_dynamo_endpoint()
+                ray.get(
+                    self._engine_records[index].leader.stop_dynamo_endpoint.remote(),
+                    timeout=self._control_timeout_s,
+                )
             except Exception:
                 LOGGER.exception("Could not stop a Megatron engine's Dynamo endpoint")
                 stopped = False
+        if index < len(self._engines):
+            engine = self._engines[index]
             try:
                 engine_stopped = engine.shutdown()
             except Exception:
