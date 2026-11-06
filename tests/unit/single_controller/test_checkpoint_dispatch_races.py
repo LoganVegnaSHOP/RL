@@ -592,8 +592,6 @@ def _reserve_controller() -> Any:
     controller._filtered_reserve = deque()
     controller._filtered_prompts_by_step = {}
     controller._steps_allowed_short = set()
-    controller._filtered_refill_wanted = asyncio.Event()
-    controller._filtered_pool_cv = asyncio.Condition()
     controller._dataloader_exhausted = False
     controller._async_cfg = SimpleNamespace(
         rollout_failure=SimpleNamespace(
@@ -2396,9 +2394,7 @@ def test_checkpoint_completes_while_filtered_replacement_waits(exhausted: bool) 
         release_checkpoint = asyncio.Event()
 
         async def replace() -> None:
-            async with controller._replacement_mutation(
-                filtered=True, target_step=7
-            ) as cut:
+            async with controller._replacement_mutation(filtered=True) as cut:
                 spare = controller._pop_filtered_replacement(7)
                 manager.discard_prompt_group(cut, old_id)
                 if spare is not None:
@@ -2413,13 +2409,18 @@ def test_checkpoint_completes_while_filtered_replacement_waits(exhausted: bool) 
                 await release_checkpoint.wait()
 
         consumer = asyncio.create_task(replace())
-        await controller._filtered_refill_wanted.wait()
+        await asyncio.sleep(0)
         saver = asyncio.create_task(checkpoint())
         await checkpoint_entered.wait()
-        batches = [] if exhausted else [BatchedDataDict({"idx": [21]})]
-        refiller = asyncio.create_task(
-            controller._await_servicing_refills(replaced.wait(), iter(batches))
-        )
+
+        async def refill() -> None:
+            async with barrier.mutation("prompt_reservations"):
+                if exhausted:
+                    controller._dataloader_exhausted = True
+                else:
+                    controller._filtered_reserve.append(_reserve_prompt(21))
+
+        refiller = asyncio.create_task(refill())
         await asyncio.sleep(0)
         assert not replaced.is_set()
         release_checkpoint.set()
@@ -2456,9 +2457,7 @@ def test_filtered_replacement_rechecks_pool_after_waiting_for_checkpoint() -> No
                 await release_checkpoint.wait()
 
         async def replace(old_id: str) -> None:
-            async with controller._replacement_mutation(
-                filtered=True, target_step=7
-            ) as cut:
+            async with controller._replacement_mutation(filtered=True) as cut:
                 spare = controller._pop_filtered_replacement(7)
                 assert spare is not None
                 manager.discard_prompt_group(cut, old_id)
@@ -2471,15 +2470,15 @@ def test_filtered_replacement_rechecks_pool_after_waiting_for_checkpoint() -> No
             await asyncio.sleep(0)
         release_checkpoint.set()
         await saver
-        await controller._filtered_refill_wanted.wait()
+        while controller._filtered_reserve:
+            await asyncio.sleep(0)
         # A second checkpoint can enter while the losing consumer waits for refill.
         async with barrier.checkpoint():
             owners = {g.prompt_id for g in manager.recovery_ledger.groups()}
             assert "21" in owners
             assert len(owners & {"20", "30"}) == 1
         async with barrier.mutation():
-            controller._serve_filtered_refill(iter([BatchedDataDict({"idx": [22]})]))
-        await controller._wake_filtered_waiters()
+            controller._filtered_reserve.append(_reserve_prompt(22))
         await asyncio.gather(*consumers)
         assert sorted(g.prompt_id for g in manager.recovery_ledger.groups()) == [
             "21",
@@ -2508,9 +2507,7 @@ def test_checkpoint_waits_for_filtered_pop_and_reownership() -> None:
         checkpoint_entered = asyncio.Event()
 
         async def replace() -> None:
-            async with controller._replacement_mutation(
-                filtered=True, target_step=7
-            ) as cut:
+            async with controller._replacement_mutation(filtered=True) as cut:
                 spare = controller._pop_filtered_replacement(7)
                 assert spare is not None
                 popped.set()

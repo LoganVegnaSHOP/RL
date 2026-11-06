@@ -116,8 +116,6 @@ def _init_pump_ledgers(ctrl: Any) -> None:
     ctrl._filtered_reserve = deque()
     ctrl._filtered_prompts_by_step = {}
     ctrl._steps_allowed_short = set()
-    ctrl._filtered_refill_wanted = asyncio.Event()
-    ctrl._filtered_pool_cv = asyncio.Condition()
     ctrl._dataloader_exhausted = False
     ctrl._rollout_slot_waiters = 0
     ctrl._rollout_permitted_waiters = 0
@@ -461,7 +459,7 @@ def _pump_controller(
     """A hand-built controller for the rollout pump.
 
     ``dynamic_sampling_max_replacements`` None leaves dynamic sampling off; an int
-    turns it on with that per-slot budget.
+    turns it on with that many replacement batches beyond the initial batch.
     """
     buffer = _RecordingBuffer() if buffer is None else buffer
     controller_cls = SingleControllerActor.__ray_metadata__.modified_class
@@ -501,23 +499,6 @@ def _pump_controller(
     ) * num_prompts_per_step
     ctrl._sampler_stamps_target_steps = False
     return ctrl
-
-
-@pytest.mark.parametrize("refill_first", [False, True])
-def test_refill_and_normal_reads_share_epoch_transitions(refill_first: bool) -> None:
-    ctrl = _pump_controller(_ScriptedRolloutManager([]), [_batch("prompt")])
-    ctrl._algo_cfg.max_num_epochs = 2
-    iterator = ctrl._iter_prompt_batches()
-    assert next(iterator)["message_log"][0][0]["content"] == "prompt"
-    if refill_first:
-        assert ctrl._serve_filtered_refill(iterator)
-    else:
-        assert next(iterator)["message_log"][0][0]["content"] == "prompt"
-    assert ctrl._current_epoch == 1
-    assert not ctrl._dataloader_exhausted
-    assert not ctrl._serve_filtered_refill(iterator)
-    assert ctrl._current_epoch == 2
-    assert ctrl._dataloader_exhausted
 
 
 def test_filtered_group_can_draw_from_the_next_epoch() -> None:
@@ -576,7 +557,6 @@ class TestDynamicSamplingReplacement:
             ]
             try:
                 await asyncio.sleep(0)
-                assert ctrl._filtered_refill_wanted.is_set()
                 assert all(not waiter.done() for waiter in waiters)
                 assert await ctrl._divert_batch_to_reserve(_batch("a", "b"))
                 prompts = await asyncio.wait_for(asyncio.gather(*waiters), timeout=1)
@@ -606,7 +586,7 @@ class TestDynamicSamplingReplacement:
             ctrl._redispatch_restored_rollouts = AsyncMock()
             waiter = asyncio.create_task(ctrl._take_filtered_replacement(0))
             try:
-                await ctrl._filtered_refill_wanted.wait()
+                await asyncio.sleep(0)
                 assert not waiter.done()
                 await asyncio.wait_for(ctrl._rollout_pump(), timeout=1)
                 assert await asyncio.wait_for(waiter, timeout=1) is None
@@ -644,9 +624,7 @@ class TestDynamicSamplingReplacement:
         assert ctrl._rollout_exhausted.is_set()
 
     def test_a_filtered_group_is_replaced_even_under_shrink(self):
-        # on_dropped_prompt governs infrastructure failures. Training on a group whose
-        # generations all scored the same is never right, so the filter replaces it
-        # regardless, out of a pool the pump refills on demand.
+        # Filtering replaces groups independently of the rollout-failure policy.
         manager = _ScriptedRolloutManager([RolloutOutcome.FILTERED])
         ctrl = _pump_controller(
             manager,
@@ -971,9 +949,7 @@ class TestTakeReplacement:
         assert len(ctrl._replacement_reserve) == 2, "pool left untouched"
 
     def test_a_non_stamping_sampler_has_no_short_step_to_repair(self):
-        # The sampler's capability decides, not this call's target_step: a sampler
-        # that stamps no steps has nothing waiting on a replacement, so even a valid
-        # target_step with spares on hand still shrinks.
+        # Non-stamping samplers have no waiting step to repair.
         ctrl = self._controller(spares=2, stamps_target_steps=False)
         assert ctrl._take_replacement(0) is None
 
@@ -1052,18 +1028,16 @@ class TestTargetGroupsForStep:
         with pytest.raises(RuntimeError, match="below the floor of 128"):
             ctrl._target_groups_for_step(0)
 
-    def test_the_error_names_the_spare_pool_only_under_dynamic_sampling(self):
-        # The two generic causes send the reader to the cluster. Under filtering an
-        # empty spare pool is the likelier one, and it is fixed by a config change.
-        quiet = self._controller(128, {0: 128})
-        with pytest.raises(RuntimeError) as without_filtering:
-            quiet._target_groups_for_step(0)
-        assert "spare pool" not in str(without_filtering.value)
-
-        filtering = self._controller(128, {0: 128})
-        filtering._dynamic_sampling_enabled = True
-        with pytest.raises(RuntimeError, match="an empty spare pool"):
-            filtering._target_groups_for_step(0)
+    @pytest.mark.parametrize("dynamic_sampling", [False, True])
+    def test_floor_error_does_not_recommend_the_fault_tolerance_pool(
+        self, dynamic_sampling
+    ):
+        ctrl = self._controller(128, {0: 128}, fraction=1.0)
+        ctrl._dynamic_sampling_enabled = dynamic_sampling
+        with pytest.raises(RuntimeError, match="below the floor of 128") as error:
+            ctrl._target_groups_for_step(0)
+        assert "replacement_reserve_prompts" not in str(error.value)
+        assert "spare pool" not in str(error.value)
 
 
 def test_abort_stale_inflight_cancels_only_out_of_window_rollouts() -> None:
@@ -1915,3 +1889,12 @@ def test_rollout_pump_writes_expected_tq_data(
             "num_assistant_messages",
             "num_routed_experts_backfilled",
         }
+
+
+def test_dynamic_sampling_off_keeps_the_original_admission_wait() -> None:
+    ctrl = _pump_controller(_ScriptedRolloutManager([]), [_batch("a"), _batch("b")])
+    wait = AsyncMock(wraps=ctrl._sampler.wait_until_admissible)
+    ctrl._sampler.wait_until_admissible = wait
+    asyncio.run(asyncio.wait_for(ctrl._rollout_pump(), timeout=2))
+    assert wait.await_count == 2
+    assert not ctrl._filtered_reserve

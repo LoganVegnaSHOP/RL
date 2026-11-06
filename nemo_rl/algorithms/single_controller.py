@@ -91,6 +91,7 @@ from nemo_rl.algorithms.async_utils.replay_buffer import (
     validate_forest_checkpoint_metadata,
 )
 from nemo_rl.algorithms.async_utils.staleness_sampler import (
+    InOrderSampler,
     ReadyFirstSamplerConfig,
     TransactionalAdmissionSampler,
     create_sampler,
@@ -880,11 +881,6 @@ class SingleControllerActor:
         )
         # Prompts a step has drawn beyond the batch it was admitted with.
         self._filtered_prompts_by_step: dict[int, int] = {}
-        # Set by a dispatch task that found the pool empty; the pump services it even
-        # while waiting to admit, which is the window the pool used to run dry in.
-        self._filtered_refill_wanted: asyncio.Event = asyncio.Event()
-        # Guards the pool against a lost wakeup between "found it empty" and "waited".
-        self._filtered_pool_cv: asyncio.Condition = asyncio.Condition()
         # Set once the dataloader has nothing left, so waiters stop waiting.
         self._dataloader_exhausted: bool = False
         # Data-exhausted steps are collected to completion, then trained or skipped
@@ -1716,15 +1712,14 @@ class SingleControllerActor:
         self,
         group_ids: list[str],
         *,
-        refill_iterator: Any = None,
+        wait_until_admissible: Optional[Callable[[], Awaitable[None]]] = None,
     ) -> Optional[int]:
         """Commit one admission and mark every reserved group as admitted.
 
         Args:
             group_ids: The reserved groups this admission stamps.
-            refill_iterator: The pump's dataloader iterator, so the filter pool can be
-                refilled while this waits to admit. None skips that, which is right for
-                the end-of-data drain: there is nothing left to refill from.
+            wait_until_admissible: Pump-owned admission wait that can refill prompts.
+                Omitted when draining reserves after final data exhaustion.
 
         Returns:
             The target-step stamp assigned to every group.
@@ -1749,7 +1744,12 @@ class SingleControllerActor:
             return target_step
 
         if isinstance(self._sampler, TransactionalAdmissionSampler):
-            await self._wait_admissible_servicing_refills(refill_iterator)
+            if wait_until_admissible is not None:
+                await wait_until_admissible()
+            else:
+                await self._sampler.wait_until_admissible(
+                    trainer_version_fn=lambda: self._trainer_version
+                )
             async with self._data_plane_checkpoint_barrier.mutation(
                 "prompt_reservations"
             ) as cut:
@@ -1773,6 +1773,8 @@ class SingleControllerActor:
     async def _redispatch_restored_rollouts(
         self,
         launch: Callable[[DatumSpec, Optional[int], str], Awaitable[None]],
+        *,
+        wait_until_admissible: Optional[Callable[[], Awaitable[None]]] = None,
     ) -> None:
         """Prioritize durable unfinished groups while the train pump drains TQ.
 
@@ -1831,7 +1833,9 @@ class SingleControllerActor:
                     group.group_id
                 )
         for group_ids in reserved_admissions.values():
-            await self._admit_reserved_prompt_groups(group_ids)
+            await self._admit_reserved_prompt_groups(
+                group_ids, wait_until_admissible=wait_until_admissible
+            )
             for group_id in group_ids:
                 group = recovery_ledger.get_group(group_id)
                 await launch(
@@ -2770,7 +2774,7 @@ class SingleControllerActor:
                         if self._rollout_recovery_enabled:
                             assert lineage_group_id is not None
                             async with self._replacement_mutation(
-                                filtered=filtered, target_step=target_step
+                                filtered=filtered
                             ) as cut:
                                 replacement = (
                                     self._pop_filtered_replacement(target_step)
@@ -2885,12 +2889,55 @@ class SingleControllerActor:
                 self._buffer_capacity.release()
                 sem.release()
 
+        dataloader_iterator = self._iter_prompt_batches()
+
+        async def maybe_refill() -> None:
+            if (
+                not self._dynamic_sampling_enabled
+                or self._dataloader_exhausted
+                or len(self._filtered_reserve) >= self._algo_cfg.num_prompts_per_step
+            ):
+                return
+            async with (
+                self._data_plane_checkpoint_barrier.mutation("prompt_reservations")
+                if self._rollout_recovery_enabled
+                else contextlib.nullcontext()
+            ):
+                batch = next(dataloader_iterator, None)
+                if batch is None:
+                    self._dataloader_exhausted = True
+                    return
+                for i in range(batch.size):
+                    prompt = cast(
+                        DatumSpec, {key: value[i] for key, value in batch.items()}
+                    )
+                    self._filtered_reserve.append(prompt)
+
+        async def wait_with_maybe_refill(lock: asyncio.Semaphore) -> None:
+            if self._dynamic_sampling_enabled:
+                while lock.locked():
+                    await maybe_refill()
+                    await asyncio.sleep(0.1)
+            await lock.acquire()
+
+        async def wait_for_admission() -> None:
+            if self._dynamic_sampling_enabled:
+                if not isinstance(self._sampler, InOrderSampler):
+                    raise RuntimeError("dynamic sampling requires the in_order sampler")
+                while not self._sampler.can_admit(
+                    trainer_version=self._trainer_version
+                ):
+                    await maybe_refill()
+                    await asyncio.sleep(0.1)
+            else:
+                await self._sampler.wait_until_admissible(
+                    trainer_version_fn=lambda: self._trainer_version
+                )
+
         async def _launch(
             prompt: DatumSpec,
             target_step: Optional[int],
             lineage_group_id: Optional[str],
-            *,
-            refill_iterator: Any = None,
         ) -> None:
             if self._rollout_recovery_enabled and lineage_group_id is None:
                 raise RuntimeError(
@@ -2901,21 +2948,13 @@ class SingleControllerActor:
             # check if buffer is full
             self._buffer_capacity_waiters += 1
             try:
-                if refill_iterator is not None and self._buffer_capacity.locked():
-                    await self._await_servicing_refills(
-                        self._buffer_capacity.acquire(), refill_iterator
-                    )
-                else:
-                    await self._buffer_capacity.acquire()
+                await wait_with_maybe_refill(self._buffer_capacity)
             finally:
                 self._buffer_capacity_waiters -= 1
             # check if inflight rollouts is full
             self._rollout_slot_waiters += 1
             try:
-                if refill_iterator is not None and sem.locked():
-                    await self._await_servicing_refills(sem.acquire(), refill_iterator)
-                else:
-                    await sem.acquire()
+                await wait_with_maybe_refill(sem)
             finally:
                 self._rollout_slot_waiters -= 1
             # wait for rollout to be permitted
@@ -2947,10 +2986,11 @@ class SingleControllerActor:
                 )
             )
 
-        dataloader_iterator = self._iter_prompt_batches()
         async with asyncio.TaskGroup() as rollout_tasks:
             if self._rollout_recovery_enabled:
-                await self._redispatch_restored_rollouts(_launch)
+                await self._redispatch_restored_rollouts(
+                    _launch, wait_until_admissible=wait_for_admission
+                )
             if not self._rollout_recovery_enabled:
                 # An explicit iterator, not `for ... in`, so the pump can pull an
                 # extra batch for the filter pool while it waits to admit.
@@ -2958,12 +2998,13 @@ class SingleControllerActor:
                     prompt_batch = next(dataloader_iterator, None)
                     if prompt_batch is None:
                         self._dataloader_exhausted = True
-                        await self._wake_filtered_waiters()
                         break
                     if await self._divert_batch_to_reserve(prompt_batch):
                         continue
-                    target_step = await self._admit_servicing_refills(
-                        dataloader_iterator
+                    if self._dynamic_sampling_enabled:
+                        await wait_for_admission()
+                    target_step = await self._sampler.admit(
+                        trainer_version_fn=lambda: self._trainer_version
                     )
                     if target_step is not None:
                         self._sampler_stamps_target_steps = True
@@ -2976,7 +3017,6 @@ class SingleControllerActor:
                             prompt,
                             target_step,
                             None,
-                            refill_iterator=dataloader_iterator,
                         )
 
             else:
@@ -2989,7 +3029,6 @@ class SingleControllerActor:
                             prompt_batch = next(dataloader_iterator)
                         except StopIteration:
                             self._dataloader_exhausted = True
-                            await self._wake_filtered_waiters()
                             break
                         if await self._divert_batch_to_reserve(prompt_batch):
                             continue
@@ -3009,7 +3048,7 @@ class SingleControllerActor:
 
                     target_step = await self._admit_reserved_prompt_groups(
                         [group_id for _, group_id in prompt_dispatches],
-                        refill_iterator=dataloader_iterator,
+                        wait_until_admissible=wait_for_admission,
                     )
 
                     for prompt, group_id in prompt_dispatches:
@@ -3017,7 +3056,6 @@ class SingleControllerActor:
                             prompt,
                             target_step,
                             group_id,
-                            refill_iterator=dataloader_iterator,
                         )
 
         # Only now that every dispatched rollout has settled is the pool genuinely
@@ -3101,7 +3139,6 @@ class SingleControllerActor:
                 k: v[prompt_idx] for k, v in prompt_batch.items()
             }
             pool.append(spare)
-        await self._wake_filtered_waiters()
         print(
             f"  {name} pool refilled with {prompt_batch.size} prompt(s) "
             f"(low-water mark {mark}); this batch is "
@@ -3273,25 +3310,22 @@ class SingleControllerActor:
         ``on_dropped_prompt`` nor spends the fault-tolerance budget, and it draws on
         dynamic sampling's own pool.
 
-        Blocks rather than giving up when the pool is empty. The pump is the only owner
-        of the dataloader, so a task that needs a spare asks it for one and waits; the
-        pump services that request even while it is waiting to admit, which is the
-        window a finite pool used to run dry in.
+        Blocks while the pool is empty and data remains. Only the pump reads the
+        dataloader; it polls and refills this pool while waiting for admission or
+        dispatch capacity, including during checkpoint recovery.
 
         Returns:
             A spare prompt, or None once the dataloader is exhausted and no spare is
-            left. That is the end of the run, so the caller credits the step short and
-            the step is exempted from the batch-size floor.
+            left. The caller credits the step short, then the trainer applies the
+            configured batch floor to decide whether to train or skip it.
         """
         await self._wait_for_filtered_reserve()
         return self._pop_filtered_replacement(target_step)
 
     async def _wait_for_filtered_reserve(self) -> None:
-        """Request prompts without holding a checkpoint mutation cut."""
-        async with self._filtered_pool_cv:
-            while not self._filtered_reserve and not self._dataloader_exhausted:
-                self._filtered_refill_wanted.set()
-                await self._filtered_pool_cv.wait()
+        """Wait for pump refill without holding a checkpoint mutation cut."""
+        while not self._filtered_reserve and not self._dataloader_exhausted:
+            await asyncio.sleep(0.1)
 
     def _pop_filtered_replacement(
         self, target_step: Optional[int]
@@ -3308,7 +3342,7 @@ class SingleControllerActor:
 
     @contextlib.asynccontextmanager
     async def _replacement_mutation(
-        self, *, filtered: bool, target_step: Optional[int]
+        self, *, filtered: bool
     ) -> AsyncIterator[DataPlaneMutationCut]:
         """Keep spare consumption and ledger transfer atomic without blocking saves."""
         while True:
@@ -3326,82 +3360,6 @@ class SingleControllerActor:
                     continue
                 yield cut
                 return
-
-    def _serve_filtered_refill(self, iterator: Any) -> bool:
-        """Pull one dataloader batch into the filtered pool, on the pump's own task.
-
-        Returns whether the dataloader had a batch left. Callers wake the waiters.
-        """
-        self._filtered_refill_wanted.clear()
-        batch = next(iterator, None)
-        if batch is None:
-            self._dataloader_exhausted = True
-            return False
-        for prompt_idx in range(batch.size):
-            spare: DatumSpec = {  # type: ignore
-                k: v[prompt_idx] for k, v in batch.items()
-            }
-            self._filtered_reserve.append(spare)
-        print(
-            f"  dynamic sampling: refilled the filter pool with {batch.size} "
-            f"prompt(s) on demand ({len(self._filtered_reserve)} now pooled)",
-            flush=True,
-        )
-        return True
-
-    async def _wake_filtered_waiters(self) -> None:
-        """Wake every task blocked on the filtered pool after it changed."""
-        async with self._filtered_pool_cv:
-            self._filtered_pool_cv.notify_all()
-
-    async def _await_servicing_refills[T](self, work: Awaitable[T], iterator: Any) -> T:
-        """Keep the filter pool supplied while admission or dispatch is blocked."""
-        pending = asyncio.ensure_future(work)
-        try:
-            while not pending.done():
-                if iterator is None:
-                    break
-                wanted = asyncio.ensure_future(self._filtered_refill_wanted.wait())
-                try:
-                    await asyncio.wait(
-                        {pending, wanted}, return_when=asyncio.FIRST_COMPLETED
-                    )
-                finally:
-                    wanted.cancel()
-                    await asyncio.gather(wanted, return_exceptions=True)
-                if pending.done():
-                    break
-                if self._rollout_recovery_enabled:
-                    # Keep pool contents and dataloader position in the same checkpoint cut.
-                    async with self._data_plane_checkpoint_barrier.mutation(
-                        "prompt_reservations"
-                    ):
-                        self._serve_filtered_refill(iterator)
-                else:
-                    self._serve_filtered_refill(iterator)
-                await self._wake_filtered_waiters()
-            await pending
-        finally:
-            if not pending.done():
-                pending.cancel()
-                await asyncio.gather(pending, return_exceptions=True)
-        return pending.result()
-
-    async def _wait_admissible_servicing_refills(self, iterator: Any) -> None:
-        """Wait until admissible without starving filtered rollouts of prompts."""
-        await self._await_servicing_refills(
-            self._sampler.wait_until_admissible(
-                trainer_version_fn=lambda: self._trainer_version
-            ),
-            iterator,
-        )
-
-    async def _admit_servicing_refills(self, iterator: Any) -> Optional[int]:
-        """Admit once, supplying filtered rollouts while admission blocks."""
-        return await self._await_servicing_refills(
-            self._sampler.admit(trainer_version_fn=lambda: self._trainer_version),
-            iterator,
-        )
 
     def _allow_short_drained_step(self, target_step: Optional[int]) -> None:
         """Mark a drained-pool step for the final train-or-skip floor check."""
@@ -3501,15 +3459,6 @@ class SingleControllerActor:
             # gradients must be aborted if the final count falls below the floor.
             return target
         if target < floor:
-            # Explain spare-pool exhaustion when dynamic sampling shortens a step.
-            dynamic_sampling_cause = (
-                " With dynamic sampling on, a third cause is an empty spare pool: a "
-                "filtered group with no spare to draw on is credited short, so raise "
-                "async_rl.rollout_failure.replacement_reserve_prompts to at least "
-                "grpo.num_prompts_per_step."
-                if self._dynamic_sampling_enabled
-                else ""
-            )
             raise RuntimeError(
                 f"training step {step} lost {dropped} of {num_prompts_per_step} prompt "
                 f"group(s), leaving {target}, below the floor of {floor} set by "
@@ -3517,7 +3466,6 @@ class SingleControllerActor:
                 "Either the generation fleet is failing a whole step's worth of "
                 "prompts, or the drop budgets are set too high to catch it: they are "
                 "run-scoped and cannot bound how short a single step gets."
-                f"{dynamic_sampling_cause}"
             )
         return target
 
